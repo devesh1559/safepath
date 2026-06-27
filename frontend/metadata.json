@@ -1,0 +1,9 @@
+{
+  "name": "Tokyo SafePath",
+  "description": "Emergency Navigation and Hazard Reporting App",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ]
+}
