@@ -1,10 +1,52 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { GPSLocation, ChatMessage, MessageContent, AgentStreamChunk } from './types';
+import { GPSLocation, ChatMessage, MessageContent, AgentStreamChunk, SafeLocation } from './types';
 import { createAgentSession, streamAgentQuery } from './services/agentService';
 import { uploadToHazardBucket } from './services/storageService';
 import { CameraModal } from './components/CameraModal';
 
 const USER_ID = `user_${Math.random().toString(36).substring(7)}`;
+
+// Helper to calculate distance between two coordinates in km
+function getDistanceFromLatLonInKm(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371; // Radius of the earth in km
+  const dLat = deg2rad(lat2 - lat1);
+  const dLon = deg2rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+function deg2rad(deg: number) {
+  return deg * (Math.PI / 180);
+}
+
+// Helper to extract locations from agent text
+const extractLocations = (text: string): SafeLocation[] => {
+  const locations: SafeLocation[] = [];
+  // Look for coordinates: lat, lng
+  const coordRegex = /(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})/g;
+  let match;
+  let i = 1;
+  
+  while ((match = coordRegex.exec(text)) !== null) {
+    // Try to extract a name from the preceding 30 characters
+    const precedingText = text.substring(Math.max(0, match.index - 40), match.index);
+    const nameMatch = precedingText.match(/([A-Z][a-zA-Z0-9\s]+)[\s:(]*$/);
+    const name = nameMatch ? nameMatch[1].trim() : `Safe Location ${i}`;
+    
+    locations.push({
+      id: `loc-${Date.now()}-${i}`,
+      name: name,
+      lat: parseFloat(match[1]),
+      lng: parseFloat(match[2])
+    });
+    i++;
+  }
+  return locations;
+};
 
 export default function App() {
   const [gps, setGps] = useState<GPSLocation | null>(null);
@@ -14,6 +56,11 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [showCamera, setShowCamera] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isWaitingForResponse, setIsWaitingForResponse] = useState(false);
+  
+  // Safe Locations State
+  const [safeLocations, setSafeLocations] = useState<SafeLocation[]>([]);
+  const [selectedLocation, setSelectedLocation] = useState<SafeLocation | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -29,7 +76,8 @@ export default function App() {
         console.log("Agent session created:", id);
       } catch (error: any) {
         console.error("Failed to initialize agent session", error);
-        // Add a system message to inform the user
+        // Set a fallback session ID so the user can still attempt to send messages
+        setSessionId(`fallback_${Date.now()}`);
         setMessages(prev => [...prev, {
           id: Date.now().toString(),
           timestamp: Date.now(),
@@ -47,7 +95,6 @@ export default function App() {
 
   // Hardcode GPS Location to Google Office Shibuya
   useEffect(() => {
-    // Simulate a slight delay for realism, then set hardcoded coordinates
     const timer = setTimeout(() => {
       setGps({
         latitude: 35.658034,
@@ -62,13 +109,40 @@ export default function App() {
   // Auto-scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, isWaitingForResponse]);
+
+  // Parse agent messages for safe locations when processing finishes
+  useEffect(() => {
+    if (!isProcessing && messages.length > 0) {
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage.author === 'agent') {
+        const text = lastMessage.content.parts.map(p => p.text || '').join('\n');
+        const extracted = extractLocations(text);
+        
+        if (extracted.length > 0) {
+          // Calculate distances if GPS is available
+          const withDistances = extracted.map(loc => {
+            if (gps) {
+              return { 
+                ...loc, 
+                distance: getDistanceFromLatLonInKm(gps.latitude, gps.longitude, loc.lat, loc.lng) 
+              };
+            }
+            return loc;
+          });
+          
+          // Sort by distance (nearest first)
+          withDistances.sort((a, b) => (a.distance || 0) - (b.distance || 0));
+          
+          setSafeLocations(withDistances);
+          setSelectedLocation(withDistances[0]); // Select nearest by default
+        }
+      }
+    }
+  }, [isProcessing, messages, gps]);
 
   const handleSendMessage = async (content: MessageContent) => {
-    if (!sessionId) {
-      console.warn("No active session");
-      return;
-    }
+    const currentSessionId = sessionId || `fallback_${Date.now()}`;
 
     const userMessage: ChatMessage = {
       id: Date.now().toString(),
@@ -79,43 +153,49 @@ export default function App() {
 
     setMessages(prev => [...prev, userMessage]);
     setIsProcessing(true);
+    setIsWaitingForResponse(true);
     setInputText('');
 
     try {
-      const stream = streamAgentQuery(sessionId, USER_ID, content);
-      
-      // Create a placeholder for the agent's response
-      const agentMessageId = (Date.now() + 1).toString();
-      setMessages(prev => [...prev, {
-        id: agentMessageId,
-        timestamp: Date.now(),
-        author: 'agent',
-        content: { role: 'model', parts: [{ text: '' }] }
-      }]);
+      const stream = streamAgentQuery(currentSessionId, USER_ID, content);
+      let agentMessageId: string | null = null;
 
       for await (const chunk of stream) {
         const agentChunk = chunk as AgentStreamChunk;
         if (agentChunk?.content?.parts) {
           const newText = agentChunk.content.parts.map(p => p.text || '').join('');
           
-          setMessages(prev => prev.map(msg => {
-            if (msg.id === agentMessageId) {
-              // Append new text to existing text
-              const currentText = msg.content.parts[0]?.text || '';
-              return {
-                ...msg,
-                content: {
-                  ...msg.content,
-                  parts: [{ text: currentText + newText }]
-                }
-              };
-            }
-            return msg;
-          }));
+          if (!agentMessageId) {
+            // First chunk received, hide loader and create the agent message bubble
+            setIsWaitingForResponse(false);
+            agentMessageId = (Date.now() + 1).toString();
+            setMessages(prev => [...prev, {
+              id: agentMessageId!,
+              timestamp: Date.now(),
+              author: 'agent',
+              content: { role: 'model', parts: [{ text: newText }] }
+            }]);
+          } else {
+            // Subsequent chunks, append to the existing bubble
+            setMessages(prev => prev.map(msg => {
+              if (msg.id === agentMessageId) {
+                const currentText = msg.content.parts[0]?.text || '';
+                return {
+                  ...msg,
+                  content: {
+                    ...msg.content,
+                    parts: [{ text: currentText + newText }]
+                  }
+                };
+              }
+              return msg;
+            }));
+          }
         }
       }
     } catch (error: any) {
       console.error("Error sending message to agent:", error);
+      setIsWaitingForResponse(false);
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         timestamp: Date.now(),
@@ -124,6 +204,7 @@ export default function App() {
       }]);
     } finally {
       setIsProcessing(false);
+      setIsWaitingForResponse(false);
     }
   };
 
@@ -136,7 +217,6 @@ export default function App() {
       parts: [{ text: inputText }]
     };
     
-    // Append GPS context if available
     if (gps) {
       content.parts.push({
         text: `\n[Context: User is at Lat: ${gps.latitude.toFixed(4)}, Lng: ${gps.longitude.toFixed(4)}]`
@@ -149,12 +229,11 @@ export default function App() {
   const handlePhotoCapture = async (base64Data: string) => {
     setShowCamera(false);
     setIsProcessing(true);
+    setIsWaitingForResponse(true);
     
     try {
-      // 1. Upload to bucket (simulated)
       await uploadToHazardBucket(base64Data, 'image/jpeg');
       
-      // 2. Send to Agent
       const content: MessageContent = {
         role: 'user',
         parts: [
@@ -173,6 +252,7 @@ export default function App() {
     } catch (error: any) {
       console.error("Error handling photo capture:", error);
       setIsProcessing(false);
+      setIsWaitingForResponse(false);
     }
   };
 
@@ -188,7 +268,6 @@ export default function App() {
       };
       reader.readAsDataURL(file);
     }
-    // Reset input so the same file can be selected again if needed
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -196,13 +275,11 @@ export default function App() {
 
   const toggleRecording = async () => {
     if (isRecording) {
-      // Stop recording
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
         mediaRecorderRef.current.stop();
       }
       setIsRecording(false);
     } else {
-      // Start recording
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const mediaRecorder = new MediaRecorder(stream);
@@ -217,7 +294,6 @@ export default function App() {
 
         mediaRecorder.onstop = async () => {
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-          // Convert blob to base64
           const reader = new FileReader();
           reader.readAsDataURL(audioBlob);
           reader.onloadend = () => {
@@ -235,7 +311,6 @@ export default function App() {
             }
           };
           
-          // Stop all tracks to release mic
           stream.getTracks().forEach(track => track.stop());
         };
 
@@ -249,12 +324,8 @@ export default function App() {
   };
 
   const handleFindSafeBypass = () => {
-    // Hardcoded safe bypass coordinates (e.g., Yoyogi Park, a common evacuation area near Shibuya)
-    const safeLat = 35.671536;
-    const safeLng = 139.696533;
-    
-    // Open Google Maps in a new tab with the destination set to the safe bypass coordinates
-    window.open(`https://www.google.com/maps/dir/?api=1&destination=${safeLat},${safeLng}`, '_blank');
+    if (!selectedLocation) return;
+    window.open(`https://www.google.com/maps/dir/?api=1&destination=${selectedLocation.lat},${selectedLocation.lng}`, '_blank');
   };
 
   return (
@@ -266,14 +337,14 @@ export default function App() {
           <h1 className="font-headline-lg-mobile text-headline-lg-mobile font-bold text-primary">Tokyo SafePath</h1>
         </div>
         <div className="flex items-center gap-4">
-          <span className={`material-symbols-outlined ${sessionId ? 'text-success' : 'text-on-surface-variant'}`}>
+          <span className={`material-symbols-outlined ${sessionId && !sessionId.startsWith('fallback') ? 'text-success' : 'text-on-surface-variant'}`}>
             sensors
           </span>
         </div>
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 mt-16 mb-32 px-container-margin-mobile py-4 flex flex-col gap-stack-md overflow-hidden">
+      <main className="flex-1 mt-16 mb-48 px-container-margin-mobile py-4 flex flex-col gap-stack-md overflow-hidden">
         
         {/* Live Hazard Banner */}
         <div className="shrink-0 w-full bg-error-container text-on-error-container p-4 rounded-xl flex items-center gap-3 border-l-4 border-error shadow-lg">
@@ -309,7 +380,6 @@ export default function App() {
               <span className="font-title-md text-sm text-on-surface font-bold">Upload</span>
             </button>
             
-            {/* Hidden file input for local storage upload */}
             <input 
               type="file" 
               accept="image/*" 
@@ -399,7 +469,6 @@ export default function App() {
                   {/* Render text parts */}
                   {msg.content?.parts?.map((part, idx) => {
                     if (part.text) {
-                      // Simple markdown-like rendering for bold text often returned by agents
                       const formattedText = part.text.split('**').map((chunk, i) => 
                         i % 2 === 1 ? <strong key={i}>{chunk}</strong> : chunk
                       );
@@ -427,11 +496,15 @@ export default function App() {
               </div>
             ))
           )}
-          {isProcessing && messages[messages.length - 1]?.author === 'user' && (
-            <div className="self-start flex items-center gap-2 text-on-surface-variant p-2">
-              <div className="w-2 h-2 bg-primary rounded-full animate-bounce"></div>
-              <div className="w-2 h-2 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
-              <div className="w-2 h-2 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></div>
+          
+          {/* Loader shown while waiting for the first chunk from the agent */}
+          {isWaitingForResponse && (
+            <div className="self-start flex flex-col max-w-[85%] items-start">
+              <div className="p-4 bg-surface-variant text-on-surface-variant rounded-2xl rounded-tl-sm flex items-center gap-1.5 h-11">
+                <div className="w-2 h-2 bg-on-surface-variant/70 rounded-full animate-bounce"></div>
+                <div className="w-2 h-2 bg-on-surface-variant/70 rounded-full animate-bounce" style={{ animationDelay: '0.15s' }}></div>
+                <div className="w-2 h-2 bg-on-surface-variant/70 rounded-full animate-bounce" style={{ animationDelay: '0.3s' }}></div>
+              </div>
             </div>
           )}
           <div ref={chatEndRef} />
@@ -440,15 +513,39 @@ export default function App() {
       </main>
 
       {/* Bottom Navigation & Fixed Actions */}
-      <div className="fixed bottom-0 w-full z-50 bg-background/90 ios-blur">
+      <div className="fixed bottom-0 w-full z-50 bg-background/90 ios-blur flex flex-col">
+        
+        {/* Safe Locations List */}
+        {safeLocations.length > 0 && (
+          <div className="px-container-margin-mobile pt-2 pb-2 w-full overflow-x-auto flex gap-2 no-scrollbar">
+            {safeLocations.map(loc => (
+              <button
+                key={loc.id}
+                onClick={() => setSelectedLocation(loc)}
+                className={`flex-shrink-0 px-4 py-2 rounded-xl border text-left min-w-[120px] transition-colors ${
+                  selectedLocation?.id === loc.id 
+                    ? 'bg-primary-container border-primary text-on-primary-container' 
+                    : 'bg-surface-container-high border-outline-variant text-on-surface'
+                }`}
+              >
+                <div className="font-label-bold text-sm truncate">{loc.name}</div>
+                <div className="text-[10px] opacity-80">{loc.distance ? `${loc.distance.toFixed(1)} km away` : 'Unknown distance'}</div>
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Floating Primary Action Button */}
-        <div className="px-container-margin-mobile pb-4">
+        <div className="px-container-margin-mobile pb-4 pt-2">
           <button 
             onClick={handleFindSafeBypass}
-            className="w-full h-14 bg-primary-container text-on-primary-container rounded-2xl flex items-center justify-center gap-3 shadow-2xl active:scale-[0.97] transition-all border border-primary/20"
+            disabled={safeLocations.length === 0}
+            className="w-full h-14 bg-primary-container text-on-primary-container rounded-2xl flex items-center justify-center gap-3 shadow-2xl active:scale-[0.97] transition-all border border-primary/20 disabled:opacity-50 disabled:grayscale"
           >
             <span className="material-symbols-outlined !text-[24px]">route</span>
-            <span className="font-title-md text-base font-extrabold uppercase tracking-tight">Find Safe Bypass</span>
+            <span className="font-title-md text-base font-extrabold uppercase tracking-tight">
+              {safeLocations.length === 0 ? 'Awaiting Safe Routes' : 'Find Safe Bypass'}
+            </span>
           </button>
         </div>
         

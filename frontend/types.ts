@@ -4,6 +4,14 @@ export interface GPSLocation {
   accuracy: number;
 }
 
+export interface SafeLocation {
+  id: string;
+  name: string;
+  lat: number;
+  lng: number;
+  distance?: number;
+}
+
 export interface MessagePart {
   text?: string;
   inlineData?: {

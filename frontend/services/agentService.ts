@@ -8,10 +8,11 @@ const BASE_URL = `https://${LOCATION}-aiplatform.googleapis.com/v1/${AGENT_ID}`;
  * Helper function to fetch with exponential backoff retry logic.
  * Retries on 5xx errors or network failures, but not on 4xx client errors.
  */
-const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 3): Promise<Response> => {
+const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 2): Promise<Response> => {
   let retries = 0;
   while (true) {
     try {
+      console.log(`[Agent Service] Fetching ${url}... (Attempt ${retries + 1})`);
       const response = await fetch(url, options);
       if (response.ok) {
         return response;
@@ -22,7 +23,7 @@ const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 3)
         let errorMsg = response.statusText;
         try {
           const errData = await response.json();
-          if (errData && errData.error && errData.error.message) {
+          if (errData?.error?.message) {
             errorMsg = errData.error.message;
           }
         } catch (e) {
@@ -37,15 +38,15 @@ const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 3)
       }
     } catch (error: any) {
       // If it's a 4xx error or we've maxed out retries, throw immediately
-      if (retries >= maxRetries || (error.message && error.message.includes('API Error 4'))) {
+      if (retries >= maxRetries || error?.message?.includes('API Error 4')) {
         throw error;
       }
     }
     
     retries++;
-    // Exponential backoff: 2s, 4s, 8s + random jitter
-    const delay = Math.pow(2, retries) * 1000 + Math.random() * 1000;
-    console.log(`[Agent Service] Retrying request in ${Math.round(delay)}ms... (Attempt ${retries}/${maxRetries})`);
+    // Faster backoff: 0.5s-1s, 1s-1.5s
+    const delay = Math.pow(2, retries) * 500 + Math.random() * 500;
+    console.log(`[Agent Service] Retrying request in ${Math.round(delay)}ms...`);
     await new Promise(resolve => setTimeout(resolve, delay));
   }
 };
@@ -65,7 +66,7 @@ export const createAgentSession = async (userId: string): Promise<string> => {
     });
 
     const data = await response.json();
-    if (!data || !data.output || !data.output.id) {
+    if (!data?.output?.id) {
       throw new Error(`Invalid response format: ${JSON.stringify(data)}`);
     }
     return data.output.id;
@@ -101,23 +102,42 @@ export const streamAgentQuery = async function* (
     }
 
     const decoder = new TextDecoder();
+    let buffer = '';
+    
     for await (const chunk of response.body as any) {
-      const chunkText = decoder.decode(chunk, { stream: true });
-      // The stream might contain multiple JSON objects separated by newlines
-      const lines = chunkText.split('\n').filter(line => line.trim() !== '');
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split('\n');
+      
+      // Keep the last incomplete line in the buffer
+      buffer = lines.pop() || '';
+      
       for (const line of lines) {
+        if (line.trim() === '') continue;
         try {
           const parsed = JSON.parse(line);
-          if (parsed && parsed.error) {
+          if (parsed?.error) {
             throw new Error(parsed.error.message || "Stream returned an error");
           }
           yield parsed;
         } catch (e: any) {
-          if (e.message && e.message.includes("Stream returned an error")) {
+          if (e?.message && (e.message.includes("Stream returned an error") || e.message.includes("API Error"))) {
             throw e;
           }
           console.warn("Failed to parse chunk line as JSON:", line);
         }
+      }
+    }
+    
+    // Process any remaining buffer
+    if (buffer.trim() !== '') {
+      try {
+        const parsed = JSON.parse(buffer);
+        if (parsed?.error) {
+          throw new Error(parsed.error.message || "Stream returned an error");
+        }
+        yield parsed;
+      } catch (e) {
+        console.warn("Failed to parse final chunk line as JSON:", buffer);
       }
     }
   } catch (error) {
